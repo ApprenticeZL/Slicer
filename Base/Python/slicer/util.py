@@ -1044,9 +1044,7 @@ def arrayFromVTKMatrix(vmatrix):
   else:
     raise RuntimeError("Input must be vtk.vtkMatrix3x3 or vtk.vtkMatrix4x4")
   narray = np.eye(matrixSize)
-  for r in range(matrixSize):
-    for c in range(matrixSize):
-      narray[r,c] = vmatrix.GetElement(r,c)
+  vmatrix.DeepCopy(narray.ravel(), vmatrix)
   return narray
 
 def vtkMatrixFromArray(narray):
@@ -1078,15 +1076,14 @@ def updateVTKMatrixFromArray(vmatrix, narray):
   from vtk import vtkMatrix4x4
   from vtk import vtkMatrix3x3
   if isinstance(vmatrix, vtkMatrix4x4):
-    for r in range(4):
-      for c in range(4):
-        vmatrix.SetElement(r,c, narray[r,c])
+    matrixSize = 4
   elif isinstance(vmatrix, vtkMatrix3x3):
-    for r in range(3):
-      for c in range(3):
-        vmatrix.SetElement(r,c, narray[r,c])
+    matrixSize = 3
   else:
-    raise RuntimeError("Input VTK matrix must be vtk.vtkMatrix3x3 or vtk.vtkMatrix4x4")
+    raise RuntimeError("Output vmatrix must be vtk.vtkMatrix3x3 or vtk.vtkMatrix4x4")
+  if narray.shape != (matrixSize, matrixSize):
+    raise RuntimeError("Input narray size must match output vmatrix size ({0}x{0})".format(matrixSize))
+  vmatrix.DeepCopy(narray.ravel())
 
 def arrayFromTransformMatrix(transformNode, toWorld=False):
   """Return 4x4 transformation matrix as numpy array.
@@ -1189,11 +1186,12 @@ def updateMarkupControlPointsFromArray(markupsNode, narray, world = False):
       markupsNode.SetNthControlPointPositionFromArray(controlPointIndex, narray[controlPointIndex,:])
   if numberOfControlPoints >= oldNumberOfControlPoints:
     # Add new points to the markup node
+    from vtk import vtkVector3d
     for controlPointIndex in range(oldNumberOfControlPoints, numberOfControlPoints):
       if world:
-        markupsNode.AddControlPointWorld(vtk.vtkVector3d(narray[controlPointIndex,:]))
+        markupsNode.AddControlPointWorld(vtkVector3d(narray[controlPointIndex,:]))
       else:
-        markupsNode.AddControlPoint(vtk.vtkVector3d(narray[controlPointIndex,:]))
+        markupsNode.AddControlPoint(vtkVector3d(narray[controlPointIndex,:]))
   else:
     # Remove extra point from the markup node
     for controlPointIndex in range(oldNumberOfControlPoints, numberOfControlPoints, -1):
@@ -1238,6 +1236,27 @@ def updateVolumeFromArray(volumeNode, narray):
   volumeNode.StorableModified()
   volumeNode.Modified()
   volumeNode.InvokeEvent(slicer.vtkMRMLVolumeNode.ImageDataModifiedEvent, volumeNode)
+
+def arrayFromTableColumn(tableNode, columnName):
+  """Return values of a table node's column as numpy array.
+  Values can be modified by modifying the numpy array.
+  After all modifications has been completed, call :py:meth:`arrayFromTableColumnModified`.
+
+  .. warning:: Important: memory area of the returned array is managed by VTK,
+    therefore values in the array may be changed, but the array must not be reallocated.
+    See :py:meth:`arrayFromVolume` for details.
+  """
+  import vtk.util.numpy_support
+  columnData = tableNode.GetTable().GetColumnByName(columnName)
+  narray = vtk.util.numpy_support.vtk_to_numpy(columnData)
+  return narray
+
+def arrayFromTableColumnModified(tableNode, columnName):
+  """Indicate that modification of a numpy array returned by :py:meth:`arrayFromModelPoints` has been completed."""
+  import vtk.util.numpy_support
+  columnData = tableNode.GetTable().GetColumnByName(columnName)
+  columnData.Modified()
+  tableNode.GetTable().Modified()
 
 def updateTableFromArray(tableNode, narrays, columnNames=None):
   """Sets values in a table node from a numpy array.

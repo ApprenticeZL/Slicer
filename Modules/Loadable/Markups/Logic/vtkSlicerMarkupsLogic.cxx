@@ -47,13 +47,9 @@
 #include "vtkMRMLSceneViewNode.h"
 
 // VTK includes
-//#include <vtkAdaptiveSubdivisionFilter.h>
 #include <vtkCleanPolyData.h>
 #include <vtkDelaunay2D.h>
 #include <vtkDiskSource.h>
-//#include <vtkLinearSubdivisionFilter.h>
-//#include <vtkButterflySubdivisionFilter.h>
-//#include <vtkLoopSubdivisionFilter.h>
 #include <vtkNew.h>
 #include <vtkObjectFactory.h>
 #include <vtkPlane.h>
@@ -61,12 +57,13 @@
 #include <vtkPolyData.h>
 #include <vtkPolyDataNormals.h>
 #include <vtkMassProperties.h>
-//#include <vtkSmoothPolyDataFilter.h>
 #include <vtkStringArray.h>
 #include <vtkThinPlateSplineTransform.h>
 #include <vtkTransform.h>
 #include <vtkTransformPolyDataFilter.h>
-//#include <vtkTriangleFilter.h>
+
+#include "vtk_eigen.h"
+#include VTK_EIGEN(Dense)
 
 // STD includes
 #include <cassert>
@@ -1437,22 +1434,36 @@ bool vtkSlicerMarkupsLogic::FitSurfaceProjectWarp(vtkPoints* curvePoints, vtkPol
   numberOfCurvePoints = cleanedCurvePoints->GetNumberOfPoints();
 
   // The triangulator requires all points to be on the XY plane
-  vtkSmartPointer<vtkAbstractTransform> transform = vtkSmartPointer<vtkAbstractTransform>::Take(
-    vtkDelaunay2D::ComputeBestFittingPlane(inputSurface));
-  vtkTransform* linearTransform = vtkTransform::SafeDownCast(transform);
-  if (!linearTransform)
+  vtkNew<vtkMatrix4x4> transformToBestFitPlaneMatrix;
+  if (!vtkSlicerMarkupsLogic::FitPlaneToPoints(inputSurface->GetPoints(), transformToBestFitPlaneMatrix))
     {
-    vtkGenericWarningMacro("FitSurfaceProjectWarp failed: error computing best fitting plane");
     return false;
     }
-  vtkNew<vtkTransform> transformToPlane;
+  vtkNew<vtkTransform> transformToXYPlane;
+  transformToXYPlane->SetMatrix(transformToBestFitPlaneMatrix); // set XY plane -> best-fit plane
+  transformToXYPlane->Inverse(); // // change the transform to: set best-fit plane -> XY plane
   vtkNew<vtkPoints> pointsOnPlane;
-  transform->TransformPoints(cleanedCurvePoints, pointsOnPlane);
+  transformToXYPlane->TransformPoints(cleanedCurvePoints, pointsOnPlane);
   inputSurface->SetPoints(pointsOnPlane);
   for (vtkIdType i = 0; i < numberOfCurvePoints; i++)
     {
     double* pt = pointsOnPlane->GetPoint(i);
     pointsOnPlane->SetPoint(i, pt[0], pt[1], 0.0);
+    }
+
+  // Ensure points are in counter-clockwise direction
+  // (that indicates to Delaunay2D that it is a polygon to be
+  // filled in and not a hole).
+  if (vtkSlicerMarkupsLogic::IsPolygonClockwise(pointsOnPlane))
+    {
+    vtkNew<vtkCellArray> reversePolys;
+    reversePolys->InsertNextCell(numberOfCurvePoints);
+    for (int i = numberOfCurvePoints - 1; i >= 0 ; i--)
+      {
+      reversePolys->InsertCellPoint(i);
+      }
+    reversePolys->Modified();
+    inputSurface->SetPolys(reversePolys);
     }
 
   // Add random points to improve triangulation quality.
@@ -1491,6 +1502,8 @@ bool vtkSlicerMarkupsLogic::FitSurfaceProjectWarp(vtkPoints* curvePoints, vtkPol
     }
 
   vtkNew<vtkThinPlateSplineTransform> landmarkTransform;
+  // Disable regularization to make sure transformation is correct even if source or target points are coplanar
+  landmarkTransform->SetRegularizeBulkTransform(false);
   landmarkTransform->SetBasisToR();
   landmarkTransform->SetSourceLandmarks(sourceLandmarkPoints);
   landmarkTransform->SetTargetLandmarks(targetLandmarkPoints);
@@ -1507,6 +1520,45 @@ bool vtkSlicerMarkupsLogic::FitSurfaceProjectWarp(vtkPoints* curvePoints, vtkPol
   surface->DeepCopy(polyDataNormals->GetOutput());
   return true;
 }
+
+//---------------------------------------------------------------------------
+bool vtkSlicerMarkupsLogic::IsPolygonClockwise(vtkPoints* points)
+{
+  vtkIdType numberOfPoints = points->GetNumberOfPoints();
+  if (!points || numberOfPoints < 3)
+    {
+    return false;
+    }
+
+  // Find the bottom-left point (it is on the convex hull) of the polygon,
+  // and check sign of cross-product of the edges before and after that point.
+  // (https://en.wikipedia.org/wiki/Curve_orientation#Orientation_of_a_simple_polygon)
+
+  double* point0 = points->GetPoint(0);
+  double minX = point0[0];
+  double minY = point0[1];
+  vtkIdType cornerPointIndex = 0;
+  for (vtkIdType i = 1; i < numberOfPoints; i++)
+    {
+    double* p = points->GetPoint(i);
+    if ((p[1] < minY) || ((p[1] == minY) && (p[0] < minX)))
+      {
+      cornerPointIndex = i;
+      minX = p[0];
+      minY = p[1];
+      }
+    }
+
+  double p1[3];
+  double p2[3];
+  double p3[3];
+  points->GetPoint((cornerPointIndex - 1) % numberOfPoints, p1);
+  points->GetPoint(cornerPointIndex, p2);
+  points->GetPoint((cornerPointIndex + 1) % numberOfPoints, p3);
+  double det = p2[0] * p3[1] - p2[1] * p3[0] - p1[0] * p3[1] + p1[0] * p2[1] + p1[1] * p3[0] - p1[1] * p2[0];
+  return (det < 0);
+}
+
 
 //---------------------------------------------------------------------------
 bool vtkSlicerMarkupsLogic::FitSurfaceDiskWarp(vtkPoints* curvePoints, vtkPolyData* surface, double radiusScalingFactor/*=1.0*/)
@@ -1541,6 +1593,8 @@ bool vtkSlicerMarkupsLogic::FitSurfaceDiskWarp(vtkPoints* curvePoints, vtkPolyDa
     }
 
   vtkNew<vtkThinPlateSplineTransform> landmarkTransform;
+  // Disable regularization to make sure transformation is correct even if source or target points are coplanar
+  landmarkTransform->SetRegularizeBulkTransform(false);
   landmarkTransform->SetBasisToR();
   landmarkTransform->SetSourceLandmarks(sourceLandmarkPoints);
   landmarkTransform->SetTargetLandmarks(targetLandmarkPoints);
@@ -1589,33 +1643,56 @@ bool vtkSlicerMarkupsLogic::GetBestFitPlane(vtkMRMLMarkupsNode* curveNode, vtkPl
 //---------------------------------------------------------------------------
 bool vtkSlicerMarkupsLogic::FitPlaneToPoints(vtkPoints* curvePoints, vtkPlane* plane)
 {
-  if (!curvePoints || !plane)
+  if (!curvePoints || !plane || curvePoints->GetNumberOfPoints() < 3)
     {
     return false;
     }
-  vtkNew<vtkPolyData> pointSet;
-  pointSet->SetPoints(curvePoints);
-  vtkSmartPointer<vtkAbstractTransform> transform = vtkSmartPointer<vtkAbstractTransform>::Take(
-    vtkDelaunay2D::ComputeBestFittingPlane(pointSet));
-  vtkTransform* linearTransform = vtkTransform::SafeDownCast(transform->GetInverse());
-  if (!linearTransform)
+
+  vtkNew<vtkMatrix4x4> transformToBestFitPlane;
+  if (!vtkSlicerMarkupsLogic::FitPlaneToPoints(curvePoints, transformToBestFitPlane))
     {
     return false;
     }
-  vtkMatrix4x4* transformMatrix = linearTransform->GetMatrix();
-  double position[3] =
+  plane->SetOrigin(transformToBestFitPlane->GetElement(0, 3), transformToBestFitPlane->GetElement(1, 3), transformToBestFitPlane->GetElement(2, 3));
+  plane->SetNormal(transformToBestFitPlane->GetElement(0, 2), transformToBestFitPlane->GetElement(1, 2), transformToBestFitPlane->GetElement(2, 2));
+  return true;
+}
+
+
+//---------------------------------------------------------------------------
+bool vtkSlicerMarkupsLogic::FitPlaneToPoints(vtkPoints* curvePoints, vtkMatrix4x4* transformToBestFitPlane)
+{
+  if (!curvePoints || !transformToBestFitPlane || curvePoints->GetNumberOfPoints() < 3)
     {
-    transformMatrix->GetElement(0, 3),
-    transformMatrix->GetElement(1, 3),
-    transformMatrix->GetElement(2, 3)
-    };
-  double normal[3] =
+    return false;
+    }
+
+  vtkIdType numberOfPoints = curvePoints->GetNumberOfPoints();
+  Eigen::MatrixXd pointCoords(3, numberOfPoints);
+  double point[3] = { 0.0 };
+  for (vtkIdType pointIndex = 0; pointIndex < numberOfPoints; ++pointIndex)
     {
-    transformMatrix->GetElement(0, 2),
-    transformMatrix->GetElement(1, 2),
-    transformMatrix->GetElement(2, 2)
-    };
-  plane->SetOrigin(position);
-  plane->SetNormal(normal);
+    curvePoints->GetPoint(pointIndex, point);
+    pointCoords(0, pointIndex) = point[0];
+    pointCoords(1, pointIndex) = point[1];
+    pointCoords(2, pointIndex) = point[2];
+    }
+  // Subtract centroid
+  Eigen::Vector3d centroid(pointCoords.row(0).mean(), pointCoords.row(1).mean(), pointCoords.row(2).mean());
+  pointCoords.row(0).array() -= centroid(0);
+  pointCoords.row(1).array() -= centroid(1);
+  pointCoords.row(2).array() -= centroid(2);
+  Eigen::BDCSVD<Eigen::MatrixXd> svd(pointCoords, Eigen::ComputeFullU);
+  const Eigen::MatrixXd& u = svd.matrixU();
+
+  transformToBestFitPlane->Identity();
+  for (int row = 0; row < 3; row++)
+    {
+    transformToBestFitPlane->SetElement(row, 0, svd.matrixU()(row,0));
+    transformToBestFitPlane->SetElement(row, 1, svd.matrixU()(row, 1));
+    transformToBestFitPlane->SetElement(row, 2, svd.matrixU()(row, 2));
+    transformToBestFitPlane->SetElement(row, 3, centroid(row));
+    }
+
   return true;
 }

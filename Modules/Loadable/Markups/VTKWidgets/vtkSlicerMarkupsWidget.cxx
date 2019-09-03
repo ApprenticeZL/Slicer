@@ -469,8 +469,10 @@ bool vtkSlicerMarkupsWidget::RemovePreviewPoint()
     // no preview point
     return false;
     }
-
-  markupsNode->RemoveNthControlPoint(this->PreviewPointIndex);
+  if (markupsNode->GetNthControlPointPositionStatus(this->PreviewPointIndex) == vtkMRMLMarkupsNode::PositionPreview)
+    {
+    markupsNode->RemoveNthControlPoint(this->PreviewPointIndex);
+    }
   this->PreviewPointIndex = -1;
   return true;
 }
@@ -714,7 +716,7 @@ void vtkSlicerMarkupsWidget::StartWidgetInteraction(vtkMRMLInteractionEventData*
     // Maintain this during interaction such as translating (don't
     // force center of widget to snap to mouse position)
     double pos[2] = { 0.0 };
-    if (rep->GetNthNodeDisplayPosition(activeControlPointIndex, pos))
+    if (rep->GetNthControlPointDisplayPosition(activeControlPointIndex, pos))
       {
       // save offset
       this->StartEventOffsetPosition[0] = startEventPos[0] - pos[0];
@@ -1005,7 +1007,7 @@ void vtkSlicerMarkupsWidget::RotateWidget(double eventPos[2])
     slicePos[0] = this->LastEventPosition[0];
     slicePos[1] = this->LastEventPosition[1];
 
-    rep3d->GetTransformationReferencePoint(center);
+    rep2d->GetTransformationReferencePoint(center);
 
     rep2d->GetSliceToWorldCoordinates(slicePos, lastWorldPos);
 
